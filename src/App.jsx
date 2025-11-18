@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -11,12 +11,23 @@ function StatCard({ label, value }) {
   )
 }
 
+function Badge({ children }) {
+  return <span className="px-2 py-0.5 rounded bg-slate-900/60 border border-slate-700 text-blue-200/90">{children}</span>
+}
+
 function App() {
   const [loading, setLoading] = useState(false)
   const [seeded, setSeeded] = useState(false)
   const [logs, setLogs] = useState([])
   const [analytics, setAnalytics] = useState(null)
   const [statusMsg, setStatusMsg] = useState('')
+
+  // Agentic state
+  const [agentConfig, setAgentConfig] = useState(null)
+  const [agentStatus, setAgentStatus] = useState(null)
+  const [gmailQueue, setGmailQueue] = useState([])
+  const [autoRun, setAutoRun] = useState(false)
+  const intervalRef = useRef(null)
 
   const [form, setForm] = useState({
     from_email: 'vendor@example.com',
@@ -26,7 +37,27 @@ function App() {
 
   useEffect(() => {
     refreshAll()
+    loadAgentMeta()
+    pollGmail()
   }, [])
+
+  useEffect(() => {
+    if (autoRun) {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+      intervalRef.current = setInterval(async () => {
+        await runOnce(false)
+        await pollGmail()
+        await refreshAll()
+        await loadAgentStatus()
+      }, 3000)
+    } else {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+      intervalRef.current = null
+    }
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+    }
+  }, [autoRun])
 
   const api = async (path, opts = {}) => {
     const res = await fetch(`${BACKEND_URL}${path}`, {
@@ -53,6 +84,37 @@ function App() {
     }
   }
 
+  const loadAgentMeta = async () => {
+    try {
+      const [cfg, st] = await Promise.all([
+        api('/agent/config').catch(() => null),
+        api('/agent/status').catch(() => null),
+      ])
+      if (cfg) setAgentConfig(cfg)
+      if (st) setAgentStatus(st)
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const loadAgentStatus = async () => {
+    try {
+      const st = await api('/agent/status')
+      setAgentStatus(st)
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const pollGmail = async () => {
+    try {
+      const res = await api('/gmail/poll')
+      setGmailQueue(res.items || [])
+    } catch (e) {
+      setGmailQueue([])
+    }
+  }
+
   const handleSeed = async () => {
     setStatusMsg('Seeding sample vendor requests...')
     try {
@@ -60,6 +122,7 @@ function App() {
       setSeeded(true)
       setStatusMsg('Seeded sample vendor requests.')
       await refreshAll()
+      await loadAgentStatus()
     } catch (e) {
       setStatusMsg(`Failed to seed: ${e.message}`)
     }
@@ -71,20 +134,41 @@ function App() {
       await api('/ingest/mock-email', { method: 'POST', body: JSON.stringify(form) })
       setStatusMsg('Email ingested. You can now Process Next.')
       await refreshAll()
+      await pollGmail()
+      await loadAgentStatus()
     } catch (e) {
       setStatusMsg(`Failed to ingest: ${e.message}`)
     }
   }
 
   const handleProcess = async () => {
-    setStatusMsg('Processing next email...')
+    await runOnce(true)
+  }
+
+  const runOnce = async (showMsg = true) => {
+    if (showMsg) setStatusMsg('Processing next email...')
     try {
-      const res = await api('/process/next', { method: 'POST' })
+      const res = await api('/agent/run-once', { method: 'POST' })
       if (res.processed) setStatusMsg('Processed one email and replied (mock).')
       else setStatusMsg('No emails pending.')
       await refreshAll()
+      await pollGmail()
+      await loadAgentStatus()
     } catch (e) {
       setStatusMsg(`Process failed: ${e.message}`)
+    }
+  }
+
+  const runLoop = async (steps = 10) => {
+    setStatusMsg(`Running loop for up to ${steps} steps...`)
+    try {
+      const res = await api('/agent/run-loop', { method: 'POST', body: JSON.stringify({ max_steps: steps }) })
+      setStatusMsg(`Loop done. Processed ${res.processed} messages.`)
+      await refreshAll()
+      await pollGmail()
+      await loadAgentStatus()
+    } catch (e) {
+      setStatusMsg(`Run-loop failed: ${e.message}`)
     }
   }
 
@@ -99,7 +183,65 @@ function App() {
           <a href="/test" className="text-blue-300 hover:text-white underline/30">Env test</a>
         </header>
 
-        {/* Controls */}
+        {/* Agentic Controls */}
+        <div className="bg-slate-800/60 border border-blue-500/20 rounded-2xl p-6 mb-10">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <h3 className="font-semibold text-lg">Agent</h3>
+              <p className="text-blue-200/80 text-sm">Fully agentic run-loop with mock Gmail and mock Gemini, switchable later.</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <Badge>Gmail mode: {agentConfig?.gmail_mode || 'mock'}</Badge>
+                <Badge>Gemini mode: {agentConfig?.gemini_mode || 'mock'}</Badge>
+                <Badge>Pending: {agentStatus?.pending ?? 0}</Badge>
+                <Badge>In-Process: {agentStatus?.in_process ?? 0}</Badge>
+                <Badge>Responded: {agentStatus?.responded ?? 0}</Badge>
+                <Badge>Escalated: {agentStatus?.escalated ?? 0}</Badge>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => runOnce(true)} className="bg-emerald-600 hover:bg-emerald-500 rounded-lg px-4 py-2 font-semibold">Run Once</button>
+              <button onClick={() => runLoop(10)} className="bg-indigo-600 hover:bg-indigo-500 rounded-lg px-4 py-2 font-semibold">Run 10 steps</button>
+              {!autoRun ? (
+                <button onClick={() => setAutoRun(true)} className="bg-blue-600 hover:bg-blue-500 rounded-lg px-4 py-2 font-semibold">Start Auto</button>
+              ) : (
+                <button onClick={() => setAutoRun(false)} className="bg-red-600 hover:bg-red-500 rounded-lg px-4 py-2 font-semibold">Stop Auto</button>
+              )}
+            </div>
+          </div>
+          {/* Gmail Queue */}
+          <div className="mt-6">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="font-semibold">Queue (label: VM-QUERIES)</h4>
+              <button onClick={pollGmail} className="text-sm text-blue-300 hover:text-white">Refresh</button>
+            </div>
+            {gmailQueue.length === 0 ? (
+              <p className="text-blue-300/80 text-sm">Empty queue.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="text-blue-300/80">
+                    <tr>
+                      <th className="py-2 pr-4">From</th>
+                      <th className="py-2 pr-4">Subject</th>
+                      <th className="py-2 pr-4">Snippet</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gmailQueue.map((m) => (
+                      <tr key={m.messageId || m.threadId} className="border-t border-slate-700/40">
+                        <td className="py-2 pr-4 text-blue-100">{m.from}</td>
+                        <td className="py-2 pr-4 text-blue-100">{m.subject}</td>
+                        <td className="py-2 pr-4 text-blue-100/80">{m.snippet}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Manual Controls */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
           <div className="bg-slate-800/50 border border-blue-500/20 rounded-2xl p-6">
             <h3 className="font-semibold text-lg mb-3">1) Seed Sample Data</h3>
@@ -181,7 +323,7 @@ function App() {
         </div>
 
         <footer className="text-center text-blue-300/70 text-xs mt-8">
-          Label-based polling POC • Swap mock endpoints for Gmail API + Gemini when ready
+          Fully agentic label-based polling • Toggle mock/live Gmail & Gemini when ready
         </footer>
       </div>
     </div>
